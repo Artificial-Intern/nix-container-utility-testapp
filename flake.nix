@@ -1,5 +1,5 @@
 {
-  description = "Demo branch for nix-container-utility pinning: hello, version one.";
+  description = "Demo branch for nix-container-utility pinning: hello (version two) + watch.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -23,12 +23,52 @@
               const path = (req.url || "/").split("?")[0];
               const body = path === "/healthz"
                 ? { ok: true }
-                : { hello: "world", version: "one", hits };
+                : { hello: "world", version: "two", hits };
               const data = JSON.stringify(body);
               res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(data) });
               res.end(data);
             }).listen(8080, () => console.log("hello on :8080"));
           '
+        '';
+      };
+
+      responder = pkgs.writeShellScript "watch-view" ''
+        body=$(cat /var/lib/watch/history.jsonl 2>/dev/null)
+        len=$(printf "%s" "$body" | wc -c)
+        printf "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" "$len" "$body"
+      '';
+
+      watch = pkgs.writeShellApplication {
+        name = "watch";
+        runtimeInputs = [
+          pkgs.curl
+          pkgs.jq
+          pkgs.coreutils
+          pkgs.busybox
+          pkgs.bash
+        ];
+        text = ''
+          mkdir -p /var/lib/watch
+          : >> /var/lib/watch/history.jsonl
+
+          (
+            probe_file=/var/lib/watch/.probe.json
+            while true; do
+              if curl -sf --max-time 3 http://hello:8080/healthz > "$probe_file"; then
+                status=up
+              else
+                status=down
+                printf '{"ok":false}\n' > "$probe_file"
+              fi
+              jq -c --arg s "$status" '. + {status: $s, ts: now}' "$probe_file" \
+                >> /var/lib/watch/history.jsonl
+              tail -n 200000 /var/lib/watch/history.jsonl > /var/lib/watch/.tmp \
+                && mv /var/lib/watch/.tmp /var/lib/watch/history.jsonl
+              sleep 5
+            done
+          ) &
+
+          exec ${pkgs.busybox}/bin/busybox nc -lk -p 8081 -e ${responder}
         '';
       };
     in
@@ -45,6 +85,20 @@
             Entrypoint = [ "${hello}/bin/hello" ];
             Env = [ "PORT=8080" ];
             ExposedPorts = { "8080/tcp" = { }; };
+          };
+        };
+
+        watch = pkgs.dockerTools.buildLayeredImage {
+          name = "demo-watch";
+          tag = "latest";
+          contents = [
+            watch
+            pkgs.bash
+            pkgs.coreutils
+          ];
+          config = {
+            Entrypoint = [ "${watch}/bin/watch" ];
+            ExposedPorts = { "8081/tcp" = { }; };
           };
         };
       };
